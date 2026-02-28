@@ -12,11 +12,19 @@ interface ClientInfo {
     executionEnabled: boolean;
 }
 
+export interface LogEntry {
+    message: string;
+    type: number;
+    playerName: string;
+}
+
 export class VSRXServer {
     private server: http.Server;
     public connectedClients = new Map<string, ClientInfo>();
     private cachedLocalIP: string | null = null;
     readonly port = 6732;
+    public onLogReceived: ((log: LogEntry) => void) | null = null;
+    public consoleEnabled = true;
 
     constructor() {
         this.server = http.createServer((req, res) => this.handleRequest(req, res));
@@ -156,16 +164,71 @@ end`;
 
             if (url.pathname === '/loader') {
                 const host = req.headers.host || `127.0.0.1:${this.port}`;
-                const loader = `-- VSRX External Loader
+                const loader = `-- VSRX Loader with Robust Console Hook
 local HttpService = game:GetService("HttpService")
+local LogService = game:GetService("LogService")
 local player = game.Players.LocalPlayer
-local baseUrl = "http://${host}"
+local playerName = (player and player.Name) or "Server"
+local playerUserId = (player and player.UserId) or 0
+local baseUrl = getgenv().VSRX_IP or "http://${host}"
 local execName = tostring((pcall(identifyexecutor) and identifyexecutor()) or "Run")
+
+-- Robust Log Sender with executor-native request support
+local function sendLog(msg, msgType)
+    if getgenv()._VSRX_LOGGING then return end
+    getgenv()._VSRX_LOGGING = true
+    
+    task.spawn(function()
+        pcall(function()
+            local payload = HttpService:JSONEncode({
+                message = tostring(msg),
+                type = tonumber(msgType),
+                player = playerName
+            })
+            
+            -- Detect and use executor-native request (bypasses HttpService restrictions)
+            local req = (getgenv().request or getgenv().http_request or (syn and syn.request))
+            if req then
+                req({
+                    Url = baseUrl .. "/log",
+                    Method = "POST",
+                    Headers = { ["Content-Type"] = "application/json" },
+                    Body = payload
+                })
+            else
+                HttpService:PostAsync(baseUrl .. "/log", payload)
+            end
+        end)
+        getgenv()._VSRX_LOGGING = false
+    end)
+end
+
+-- Console Capture Hook (Only if enabled in VS Code)
+local consoleEnabled = ${this.consoleEnabled}
+if consoleEnabled then
+    -- Catch-up with recent logs
+    task.spawn(function()
+        pcall(function()
+            local history = LogService:GetLogHistory()
+            for i = math.max(1, #history - 15), #history do
+                local log = history[i]
+                sendLog(log.message .. " (History)", log.messageType.Value)
+            end
+        end)
+    end)
+
+    -- Connect to real-time logs
+    LogService.MessageOut:Connect(function(msg, msgType)
+        sendLog(msg, msgType.Value)
+    end)
+    
+    print("VSRX: Console Hooked (" .. execName .. ")")
+end
 
 local function poll()
     local success, script = pcall(function()
-        local name = HttpService:UrlEncode(player.Name)
-        local userId = tostring(player.UserId)
+        local name = HttpService:UrlEncode(playerName)
+        local userId = tostring(playerUserId)
         local encodedExec = HttpService:UrlEncode(execName)
         return game:HttpGet(baseUrl .. "/fetch?name=" .. name .. "&userId=" .. userId .. "&exec=" .. encodedExec)
     end)
@@ -206,6 +269,22 @@ end`;
                         }
                         res.statusCode = 200;
                         res.end(JSON.stringify({ queued: executedCount }));
+                    } catch (e) {
+                        res.statusCode = 400;
+                        res.end('Invalid JSON');
+                    }
+                } else if (url.pathname === '/log') {
+                    try {
+                        const data = JSON.parse(body);
+                        if (this.onLogReceived) {
+                            this.onLogReceived({
+                                message: data.message,
+                                type: data.type,
+                                playerName: data.player
+                            });
+                        }
+                        res.statusCode = 200;
+                        res.end('Log received');
                     } catch (e) {
                         res.statusCode = 400;
                         res.end('Invalid JSON');

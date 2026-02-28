@@ -8,6 +8,12 @@ let server: VSRXServer;
 let statusBarItem: vscode.StatusBarItem;
 let runButton: vscode.StatusBarItem;
 let savedScriptsButton: vscode.StatusBarItem;
+let scriptHubButton: vscode.StatusBarItem;
+let robloxOutputChannel: vscode.OutputChannel | undefined;
+let logBuffer: { message: string, type: number, playerName: string, count: number } | null = null;
+let logBufferTimeout: NodeJS.Timeout | null = null;
+let lastStatusBarCount = -1;
+import * as https from 'https';
 
 function notify(msg: string) {
     const config = vscode.workspace.getConfiguration('vsrx');
@@ -20,6 +26,16 @@ export function activate(context: vscode.ExtensionContext) {
     server = new VSRXServer();
     server.start();
 
+    const config = vscode.workspace.getConfiguration('vsrx');
+    server.consoleEnabled = config.get<boolean>('enableConsoleCapture') !== false;
+
+    if (server.consoleEnabled) {
+        setupConsole();
+        if (robloxOutputChannel) {
+            robloxOutputChannel.show(true);
+        }
+    }
+
     context.subscriptions.push(
         vscode.commands.registerCommand('vsrx.showClients', async () => {
             await showClientsMenu();
@@ -30,6 +46,10 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('vsrx.runScript', () => {
             if (server.hasClients()) {
                 runScript();
+
+
+
+
             } else {
                 const loader = server.getLoaderScript();
                 vscode.env.clipboard.writeText(loader);
@@ -50,12 +70,12 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
-    savedScriptsButton = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
-    savedScriptsButton.text = `$(folder-library) Saved Scripts`;
-    savedScriptsButton.tooltip = "VSRX: View and Run Saved Scripts";
-    savedScriptsButton.command = 'vsrx.showSavedScripts';
-    savedScriptsButton.show();
-    context.subscriptions.push(savedScriptsButton);
+    context.subscriptions.push(
+        vscode.commands.registerCommand('vsrx.showScriptHub', async () => {
+            await showScriptHub();
+        })
+    );
+
 
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
     statusBarItem.text = `$(versions) No Clients`;
@@ -72,6 +92,48 @@ export function activate(context: vscode.ExtensionContext) {
     runButton.show();
     context.subscriptions.push(runButton);
 
+    savedScriptsButton = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
+    savedScriptsButton.text = `$(folder-library) Save`;
+    savedScriptsButton.tooltip = "VSRX: View and Run Saved Scripts";
+    savedScriptsButton.command = 'vsrx.showSavedScripts';
+    if (config.get<boolean>('showSaveButton')) savedScriptsButton.show();
+    context.subscriptions.push(savedScriptsButton);
+
+    scriptHubButton = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 98);
+    scriptHubButton.text = `$(cloud-download) Hub`;
+    scriptHubButton.tooltip = "VSRX: Search and Run Scripts from ScriptBlox";
+    scriptHubButton.command = 'vsrx.showScriptHub';
+    if (config.get<boolean>('showHubButton')) scriptHubButton.show();
+    context.subscriptions.push(scriptHubButton);
+
+    server.onLogReceived = (log) => {
+        queueLog(log.message, log.type, log.playerName);
+    };
+
+    context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
+        if (e.affectsConfiguration('vsrx.showSaveButton')) {
+            vscode.workspace.getConfiguration('vsrx').get<boolean>('showSaveButton') ? savedScriptsButton.show() : savedScriptsButton.hide();
+        }
+        if (e.affectsConfiguration('vsrx.showHubButton')) {
+            vscode.workspace.getConfiguration('vsrx').get<boolean>('showHubButton') ? scriptHubButton.show() : scriptHubButton.hide();
+        }
+        if (e.affectsConfiguration('vsrx.enableConsoleCapture')) {
+            const enabled = vscode.workspace.getConfiguration('vsrx').get<boolean>('enableConsoleCapture') !== false;
+            server.consoleEnabled = enabled;
+            if (enabled) {
+                setupConsole();
+                if (robloxOutputChannel) {
+                    robloxOutputChannel.show(true);
+                    robloxOutputChannel.appendLine("VSRX: Console Capture Enabled.");
+                }
+            } else {
+                if (robloxOutputChannel) {
+                    robloxOutputChannel.appendLine("VSRX: Console Capture Disabled.");
+                }
+            }
+        }
+    }));
+
     setInterval(() => updateStatusBar(), 500);
 }
 
@@ -79,6 +141,15 @@ function updateStatusBar() {
     if (!server) return;
 
     const count = server.connectedClients.size;
+    if (count !== lastStatusBarCount) {
+        if (count > lastStatusBarCount && lastStatusBarCount !== -1) {
+            logToConsole(`VSRX: New client connected. Total: ${count}`, 'info');
+        } else if (count < lastStatusBarCount) {
+            logToConsole(`VSRX: Client disconnected. Total: ${count}`, 'info');
+        }
+        lastStatusBarCount = count;
+    }
+
     if (count > 0) {
         statusBarItem.text = `$(versions) ${count} Client${count !== 1 ? 's' : ''}`;
         runButton.text = `$(play) ${server.getExecutorName()}`;
@@ -204,7 +275,7 @@ async function saveScript() {
                     prompt: 'Enter script name',
                     value: `vsrx_script_${Date.now()}.lua`
                 });
-                if (!fileName) return; // User cancelled
+                if (!fileName) return;
 
                 finalPath = path.join(finalPath, fileName.endsWith('.lua') || fileName.endsWith('.luau') ? fileName : `${fileName}.lua`);
             }
@@ -290,8 +361,158 @@ async function showSavedScripts() {
     }
 }
 
+async function showScriptHub(query: string = '', page: number = 1) {
+    let url = `https://scriptblox.com/api/script/fetch?page=${page}`;
+    if (query && query.trim() !== '') {
+        url = `https://scriptblox.com/api/script/search?q=${encodeURIComponent(query)}&page=${page}`;
+    }
+
+    notify(`VSRX: Fetching scripts from ScriptBlox (Page ${page})...`);
+
+    https.get(url, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', async () => {
+            if (res.statusCode === 200) {
+                try {
+                    const parsed = JSON.parse(data);
+                    if (!parsed.result || !parsed.result.scripts || parsed.result.scripts.length === 0) {
+                        vscode.window.showInformationMessage('VSRX: No scripts found for this search.');
+                        const searchAgain = await vscode.window.showInputBox({ prompt: 'Search ScriptBlox (Leave empty for trending)', placeHolder: 'e.g. Blox Fruits' });
+                        if (searchAgain !== undefined) showScriptHub(searchAgain, 1);
+                        return;
+                    }
+
+                    const items: vscode.QuickPickItem[] = [];
+
+                    items.push({
+                        label: `$(search) Search ScriptBlox...`,
+                        description: `Current Query: ${query || 'Trending'}`,
+                        // @ts-ignore
+                        isAction: 'search'
+                    });
+
+                    for (const script of parsed.result.scripts) {
+                        items.push({
+                            label: `$(code) ${script.title}`,
+                            description: script.game && script.game.name ? `Game: ${script.game.name}` : `Universal`,
+                            detail: `Views: ${script.views} | Verified: ${script.verified ? 'Yes' : 'No'}`,
+                            // @ts-ignore
+                            scriptCode: script.script,
+                            isAction: 'run'
+                        });
+                    }
+
+                    if (page > 1) {
+                        items.push({
+                            label: `$(arrow-left) Previous Page`,
+                            description: `Go to Page ${page - 1}`,
+                            // @ts-ignore
+                            isAction: 'prev'
+                        });
+                    }
+
+                    if (parsed.result.totalPages && page < parsed.result.totalPages) {
+                        items.push({
+                            label: `$(arrow-right) Next Page`,
+                            description: `Go to Page ${page + 1}`,
+                            // @ts-ignore
+                            isAction: 'next'
+                        });
+                    }
+
+                    const selected = await vscode.window.showQuickPick(items, {
+                        placeHolder: `ScriptBlox Hub - Page ${page}/${parsed.result.totalPages || 1}`,
+                        matchOnDescription: true,
+                        matchOnDetail: true
+                    });
+
+                    if (selected) {
+                        // @ts-ignore
+                        const action = selected.isAction;
+                        if (action === 'search') {
+                            const newQuery = await vscode.window.showInputBox({
+                                prompt: 'Search ScriptBlox (Leave empty for trending)',
+                                placeHolder: 'e.g. Blox Fruits',
+                                value: query
+                            });
+                            if (newQuery !== undefined) {
+                                showScriptHub(newQuery, 1);
+                            }
+                        } else if (action === 'next') {
+                            showScriptHub(query, page + 1);
+                        } else if (action === 'prev') {
+                            showScriptHub(query, page - 1);
+                        } else if (action === 'run') {
+                            // @ts-ignore
+                            executeRawScript(selected.scriptCode);
+                        }
+                    }
+
+                } catch (e) {
+                    vscode.window.showErrorMessage('VSRX: Failed to parse ScriptBlox data.');
+                }
+            } else {
+                vscode.window.showErrorMessage(`VSRX: ScriptBlox API Error (Status: ${res.statusCode})`);
+            }
+        });
+    }).on('error', (e) => {
+        vscode.window.showErrorMessage(`VSRX: Network Error - ${e.message}`);
+    });
+}
+
+
+
+function setupConsole() {
+    if (!robloxOutputChannel) {
+        robloxOutputChannel = vscode.window.createOutputChannel("Roblox Console", "log");
+        robloxOutputChannel.appendLine("[info] VSRX: Roblox Output Console Started.");
+    }
+}
+
+function queueLog(message: string, type: number, playerName: string) {
+    if (logBuffer && logBuffer.message === message && logBuffer.type === type && logBuffer.playerName === playerName) {
+        logBuffer.count++;
+        if (logBufferTimeout) clearTimeout(logBufferTimeout);
+        logBufferTimeout = setTimeout(() => flushLogBuffer(), 100);
+    } else {
+        if (logBuffer) flushLogBuffer();
+
+        logBuffer = { message, type, playerName, count: 1 };
+        logBufferTimeout = setTimeout(() => flushLogBuffer(), 100);
+    }
+}
+
+function flushLogBuffer() {
+    if (!logBuffer || !robloxOutputChannel) return;
+
+    if (logBufferTimeout) {
+        clearTimeout(logBufferTimeout);
+        logBufferTimeout = null;
+    }
+
+    const countStr = logBuffer.count > 1 ? ` (x${logBuffer.count})` : "";
+    let typeLabel = "info";
+    if (logBuffer.type === 2) typeLabel = "warn";
+    else if (logBuffer.type === 3) typeLabel = "error";
+
+    const formattedMsg = `[${typeLabel}] [${logBuffer.playerName}] ${logBuffer.message}${countStr}`;
+    robloxOutputChannel.appendLine(formattedMsg);
+
+    logBuffer = null;
+}
+
+function logToConsole(message: string, type: string = 'info') {
+    if (!robloxOutputChannel) return;
+
+    robloxOutputChannel.appendLine(`[${type}] [system] ${message}`);
+}
+
 export function deactivate() {
     if (server) {
         server.stop();
+    }
+    if (robloxOutputChannel) {
+        robloxOutputChannel.dispose();
     }
 }
