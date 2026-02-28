@@ -32,7 +32,7 @@ export class VSRXServer {
     }
 
     public start() {
-        this.server.listen(this.port, '0.0.0.0', () => {
+        this.server.listen(this.port, '127.0.0.1', () => {
             console.log(`VSRX Server listening on port ${this.port}`);
         });
     }
@@ -52,23 +52,6 @@ export class VSRXServer {
             }
         }
         return "Inject";
-    }
-
-    private getLocalExternalIP(): string {
-        if (this.cachedLocalIP) return this.cachedLocalIP;
-        const interfaces = os.networkInterfaces();
-        for (const name of Object.keys(interfaces)) {
-            const ifaceList = interfaces[name];
-            if (ifaceList) {
-                for (const iface of ifaceList) {
-                    if (iface.family === 'IPv4' && !iface.internal) {
-                        this.cachedLocalIP = iface.address;
-                        return this.cachedLocalIP;
-                    }
-                }
-            }
-        }
-        return '127.0.0.1';
     }
 
     public getLoaderScript(): string {

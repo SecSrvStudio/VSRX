@@ -2,7 +2,6 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.VSRXServer = void 0;
 const http = require("http");
-const os = require("os");
 class VSRXServer {
     constructor() {
         this.connectedClients = new Map();
@@ -19,7 +18,7 @@ class VSRXServer {
         }, 5000);
     }
     start() {
-        this.server.listen(this.port, '0.0.0.0', () => {
+        this.server.listen(this.port, '127.0.0.1', () => {
             console.log(`VSRX Server listening on port ${this.port}`);
         });
     }
@@ -36,23 +35,6 @@ class VSRXServer {
             }
         }
         return "Inject";
-    }
-    getLocalExternalIP() {
-        if (this.cachedLocalIP)
-            return this.cachedLocalIP;
-        const interfaces = os.networkInterfaces();
-        for (const name of Object.keys(interfaces)) {
-            const ifaceList = interfaces[name];
-            if (ifaceList) {
-                for (const iface of ifaceList) {
-                    if (iface.family === 'IPv4' && !iface.internal) {
-                        this.cachedLocalIP = iface.address;
-                        return this.cachedLocalIP;
-                    }
-                }
-            }
-        }
-        return '127.0.0.1';
     }
     getLoaderScript() {
         return `-- VSRX Smart Master Loader

@@ -2,15 +2,15 @@
     "name": "vsrx",
     "displayName": "VSRX",
     "description": "VS Roblox Executor - Run Lua scripts seamlessly across all executors using Visual Studio Code.",
-    "version": "1.0.3",
+    "publisher": "VSRX-Roblox",
+    "version": "1.0.31",
     "engines": {
         "vscode": "^1.74.0"
     },
-    "publisher": "7yd7",
     "icon": "resources/VSRX.png",
     "repository": {
         "type": "git",
-        "url": "https://github.com/7yd7/VSRX"
+        "url": "https://github.com/7yd7/VSRX.git"
     },
     "homepage": "https://github.com/7yd7/VSRX",
     "bugs": {
