@@ -2,7 +2,7 @@
     "name": "vsrx",
     "displayName": "VSRX",
     "description": "VS Roblox Executor - Run Lua scripts seamlessly across all executors using Visual Studio Code.",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "engines": {
         "vscode": "^1.74.0"
     },

@@ -7,7 +7,7 @@ class VSRXServer {
     constructor() {
         this.connectedClients = new Map();
         this.cachedLocalIP = null;
-        this.port = 3000;
+        this.port = 6732;
         this.server = http.createServer((req, res) => this.handleRequest(req, res));
         setInterval(() => {
             const now = Date.now();
@@ -55,8 +55,22 @@ class VSRXServer {
         return '127.0.0.1';
     }
     getLoaderScript() {
-        const ip = this.getLocalExternalIP();
-        return `-- VSRX Master Loader\ngetgenv().VSRX_IP = "http://${ip}:${this.port}"\nloadstring(game:HttpGet(getgenv().VSRX_IP .. "/loader"))()`;
+        return `-- VSRX Smart Master Loader
+local ips = { "http://127.0.0.1:${this.port}", "http://10.0.2.2:${this.port}" }
+local found = false
+for _, ip in ipairs(ips) do
+    local s, r = pcall(function() return game:HttpGet(ip .. "/") end)
+    if s and r:find("VSRX") then 
+        getgenv().VSRX_IP = ip 
+        found = true 
+        break 
+    end
+end
+if found then 
+    loadstring(game:HttpGet(getgenv().VSRX_IP .. "/loader"))() 
+else 
+    warn("VSRX: Could not connect to any server IP.") 
+end`;
     }
     setClientExecution(clientId, enabled) {
         const client = this.connectedClients.get(clientId);
@@ -76,6 +90,12 @@ class VSRXServer {
         const hostHeader = req.headers.host || 'localhost';
         const url = new URL(req.url || '/', `http://${hostHeader}`);
         if (req.method === 'GET') {
+            if (url.pathname === '/') {
+                res.statusCode = 200;
+                res.setHeader('Content-Type', 'text/html');
+                res.end('<h1>VSRX Server is Online!</h1><p>You can execute scripts from VS Code now.</p>');
+                return;
+            }
             if (url.pathname === '/status') {
                 const data = Array.from(this.connectedClients.entries()).map(([key, c]) => ({
                     id: key,
@@ -126,7 +146,7 @@ class VSRXServer {
                 return;
             }
             if (url.pathname === '/loader') {
-                const host = req.headers.host || `${this.getLocalExternalIP()}:${this.port}`;
+                const host = req.headers.host || `127.0.0.1:${this.port}`;
                 const loader = `-- VSRX External Loader
 local HttpService = game:GetService("HttpService")
 local player = game.Players.LocalPlayer

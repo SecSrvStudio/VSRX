@@ -33,7 +33,7 @@ export function activate(context: vscode.ExtensionContext) {
             } else {
                 const loader = server.getLoaderScript();
                 vscode.env.clipboard.writeText(loader);
-                notify('VSRX: Loader script copied! Execute this in your executor first.');
+                notify('VSRX: Auto-detecting Loader script copied! Execute this in your emulator or executor.');
             }
         })
     );
@@ -123,8 +123,6 @@ async function showClientsMenu() {
         const clientId = selected.clientId;
         // @ts-ignore
         const currentEnabled = selected.clientEnabled;
-
-        // Toggle the state directly on the server instance
         server.setClientExecution(clientId, !currentEnabled);
         notify(`VSRX: Client '${selected.label.split(' ')[1]}' execution is now ${!currentEnabled ? 'ON' : 'OFF'}`);
     }
@@ -148,7 +146,7 @@ function executeRawScript(script: string) {
     const payload = JSON.stringify({ script });
     const requestOptions = {
         hostname: '127.0.0.1',
-        port: 3000,
+        port: 6732,
         path: '/execute',
         method: 'POST',
         headers: {
