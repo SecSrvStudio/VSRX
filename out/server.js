@@ -2,6 +2,8 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.VSRXServer = void 0;
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 class VSRXServer {
     constructor() {
         this.connectedClients = new Map();
@@ -9,6 +11,8 @@ class VSRXServer {
         this.port = 6732;
         this.onLogReceived = null;
         this.consoleEnabled = true;
+        this.internalUIEnabled = false;
+        this.defaultSavePath = "";
         this.server = http.createServer((req, res) => this.handleRequest(req, res));
         setInterval(() => {
             const now = Date.now();
@@ -129,92 +133,118 @@ end`;
                 res.end(script);
                 return;
             }
+            if (url.pathname === '/saved-scripts') {
+                if (!this.defaultSavePath || !fs.existsSync(this.defaultSavePath)) {
+                    res.statusCode = 200;
+                    res.end(JSON.stringify([]));
+                    return;
+                }
+                try {
+                    const files = fs.readdirSync(this.defaultSavePath)
+                        .filter(f => f.endsWith('.lua') || f.endsWith('.txt'))
+                        .filter(f => !fs.statSync(path.join(this.defaultSavePath, f)).isDirectory());
+                    res.statusCode = 200;
+                    res.setHeader('Content-Type', 'application/json');
+                    res.end(JSON.stringify(files));
+                }
+                catch (e) {
+                    res.statusCode = 500;
+                    res.end('[]');
+                }
+                return;
+            }
+            if (url.pathname === '/execute-saved') {
+                const fileName = url.searchParams.get('name');
+                if (fileName && this.defaultSavePath) {
+                    const filePath = path.join(this.defaultSavePath, fileName);
+                    if (fs.existsSync(filePath)) {
+                        try {
+                            const content = fs.readFileSync(filePath, 'utf8');
+                            for (const client of this.connectedClients.values()) {
+                                if (client.executionEnabled) {
+                                    client.pendingScript = content;
+                                }
+                            }
+                            res.statusCode = 200;
+                            res.end('Executed');
+                        }
+                        catch (e) {
+                            res.statusCode = 500;
+                            res.end('Error reading file');
+                        }
+                    }
+                    else {
+                        res.statusCode = 404;
+                        res.end('File not found');
+                    }
+                }
+                else {
+                    res.statusCode = 400;
+                    res.end('Missing name');
+                }
+                return;
+            }
+            if (url.pathname === '/iris-menu') {
+                try {
+                    const scriptPath = path.join(__dirname, '..', 'resources', 'scripts', 'iris_menu.lua');
+                    if (fs.existsSync(scriptPath)) {
+                        const content = fs.readFileSync(scriptPath, 'utf8');
+                        res.statusCode = 200;
+                        res.setHeader('Content-Type', 'text/plain');
+                        res.end(content);
+                    }
+                    else {
+                        res.statusCode = 404;
+                        res.end('-- Iris menu script not found on server');
+                    }
+                }
+                catch (e) {
+                    res.statusCode = 500;
+                    res.end('-- Error loading Iris menu script');
+                }
+                return;
+            }
             if (url.pathname === '/loader') {
-                const host = req.headers.host || `127.0.0.1:${this.port}`;
-                const loader = `-- VSRX Loader with Robust Console Hook
-local HttpService = game:GetService("HttpService")
-local LogService = game:GetService("LogService")
-local player = game.Players.LocalPlayer
-local playerName = (player and player.Name) or "Server"
-local playerUserId = (player and player.UserId) or 0
-local baseUrl = getgenv().VSRX_IP or "http://${host}"
-local execName = tostring((pcall(identifyexecutor) and identifyexecutor()) or "Run")
-
--- Robust Log Sender with executor-native request support
-local function sendLog(msg, msgType)
-    if getgenv()._VSRX_LOGGING then return end
-    getgenv()._VSRX_LOGGING = true
-    
+                try {
+                    const host = req.headers.host || `127.0.0.1:${this.port}`;
+                    const scriptPath = path.join(__dirname, '..', 'resources', 'scripts', 'loader.lua');
+                    if (fs.existsSync(scriptPath)) {
+                        let content = fs.readFileSync(scriptPath, 'utf8');
+                        content = content.replace('baseUrl = getgenv().VSRX_IP', `baseUrl = getgenv().VSRX_IP or "http://${host}"`);
+                        const consoleCheck = `getgenv()._VSRX_CONSOLE_ENABLED = ${this.consoleEnabled}`;
+                        content = content.replace('-- {{CONSOLE_ENABLED_CHECK}}', consoleCheck);
+                        let irisBootstrap = "";
+                        if (this.internalUIEnabled) {
+                            irisBootstrap = `
     task.spawn(function()
-        pcall(function()
-            local payload = HttpService:JSONEncode({
-                message = tostring(msg),
-                type = tonumber(msgType),
-                player = playerName
-            })
-            
-            -- Detect and use executor-native request (bypasses HttpService restrictions)
-            local req = (getgenv().request or getgenv().http_request or (syn and syn.request))
-            if req then
-                req({
-                    Url = baseUrl .. "/log",
-                    Method = "POST",
-                    Headers = { ["Content-Type"] = "application/json" },
-                    Body = payload
-                })
+        if not getgenv().Iris then
+            local irisSource = game:HttpGet("https://raw.githubusercontent.com/x0581/Iris-Exploit-Bundle/main/bundle.lua")
+            local factory, err = loadstring(irisSource)
+            if factory then
+                getgenv().Iris = factory()
+                getgenv().Iris.Init(game:GetService("CoreGui"))
             else
-                HttpService:PostAsync(baseUrl .. "/log", payload)
+                warn("VSRX: Failed to load Iris Library: " .. tostring(err))
+                return
             end
-        end)
-        getgenv()._VSRX_LOGGING = false
-    end)
-end
-
--- Console Capture Hook (Only if enabled in VS Code)
-local consoleEnabled = ${this.consoleEnabled}
-if consoleEnabled then
-    -- Catch-up with recent logs
-    task.spawn(function()
-        pcall(function()
-            local history = LogService:GetLogHistory()
-            for i = math.max(1, #history - 15), #history do
-                local log = history[i]
-                sendLog(log.message .. " (History)", log.messageType.Value)
-            end
-        end)
-    end)
-
-    -- Connect to real-time logs
-    LogService.MessageOut:Connect(function(msg, msgType)
-        sendLog(msg, msgType.Value)
-    end)
-    
-    print("VSRX: Console Hooked (" .. execName .. ")")
-end
-
-local function poll()
-    local success, script = pcall(function()
-        local name = HttpService:UrlEncode(playerName)
-        local userId = tostring(playerUserId)
-        local encodedExec = HttpService:UrlEncode(execName)
-        return game:HttpGet(baseUrl .. "/fetch?name=" .. name .. "&userId=" .. userId .. "&exec=" .. encodedExec)
-    end)
-    if success and script and #script > 0 then
-        local func, err = loadstring(script)
-        if func then
-            task.spawn(func)
-        else
-            warn("VSRX Load Error: " .. tostring(err))
         end
-    end
-end
-
-while task.wait(0.1) do
-    poll()
-end`;
-                res.statusCode = 200;
-                res.setHeader('Content-Type', 'text/plain');
-                res.end(loader);
+        loadstring(game:HttpGet(baseUrl .. "/iris-menu"))()
+    end)`;
+                        }
+                        content = content.replace('-- {{IRIS_BOOTSTRAP_CHECK}}', irisBootstrap);
+                        res.statusCode = 200;
+                        res.setHeader('Content-Type', 'text/plain');
+                        res.end(content);
+                    }
+                    else {
+                        res.statusCode = 404;
+                        res.end('-- Loader script not found on server');
+                    }
+                }
+                catch (e) {
+                    res.statusCode = 500;
+                    res.end('-- Error loading loader script');
+                }
                 return;
             }
         }

@@ -27,6 +27,8 @@ function activate(context) {
     server.start();
     const config = vscode.workspace.getConfiguration('vsrx');
     server.consoleEnabled = config.get('enableConsoleCapture') !== false;
+    server.internalUIEnabled = config.get('enableInternalUI') === true;
+    server.defaultSavePath = config.get('defaultSavePath') || "";
     if (server.consoleEnabled) {
         setupConsole();
         if (robloxOutputChannel) {
@@ -107,6 +109,12 @@ function activate(context) {
                     robloxOutputChannel.appendLine("VSRX: Console Capture Disabled.");
                 }
             }
+        }
+        if (e.affectsConfiguration('vsrx.enableInternalUI')) {
+            server.internalUIEnabled = vscode.workspace.getConfiguration('vsrx').get('enableInternalUI') === true;
+        }
+        if (e.affectsConfiguration('vsrx.defaultSavePath')) {
+            server.defaultSavePath = vscode.workspace.getConfiguration('vsrx').get('defaultSavePath') || "";
         }
     }));
     setInterval(() => updateStatusBar(), 500);

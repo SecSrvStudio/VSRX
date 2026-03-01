@@ -28,6 +28,8 @@ export function activate(context: vscode.ExtensionContext) {
 
     const config = vscode.workspace.getConfiguration('vsrx');
     server.consoleEnabled = config.get<boolean>('enableConsoleCapture') !== false;
+    server.internalUIEnabled = config.get<boolean>('enableInternalUI') === true;
+    server.defaultSavePath = config.get<string>('defaultSavePath') || "";
 
     if (server.consoleEnabled) {
         setupConsole();
@@ -46,10 +48,6 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('vsrx.runScript', () => {
             if (server.hasClients()) {
                 runScript();
-
-
-
-
             } else {
                 const loader = server.getLoaderScript();
                 vscode.env.clipboard.writeText(loader);
@@ -131,6 +129,12 @@ export function activate(context: vscode.ExtensionContext) {
                     robloxOutputChannel.appendLine("VSRX: Console Capture Disabled.");
                 }
             }
+        }
+        if (e.affectsConfiguration('vsrx.enableInternalUI')) {
+            server.internalUIEnabled = vscode.workspace.getConfiguration('vsrx').get<boolean>('enableInternalUI') === true;
+        }
+        if (e.affectsConfiguration('vsrx.defaultSavePath')) {
+            server.defaultSavePath = vscode.workspace.getConfiguration('vsrx').get<string>('defaultSavePath') || "";
         }
     }));
 
