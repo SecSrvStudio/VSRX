@@ -1,11 +1,15 @@
 local Iris = getgenv().Iris
+if not Iris then
+    warn("VSRX: Iris library not found. Menu script aborted.")
+    return
+end
 local HttpService = game:GetService("HttpService")
 local baseUrl = getgenv().VSRX_IP 
 local UserInputService = game:GetService("UserInputService")
 
 if not getgenv().VSRX_States then
     getgenv().VSRX_States = {
-        Opened = Iris.State(false),
+        Opened = Iris.State(false), 
         Code = Iris.State("-- VSRX Executor Ready")
     }
 end

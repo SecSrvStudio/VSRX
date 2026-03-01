@@ -7,9 +7,6 @@ local baseUrl = getgenv().VSRX_IP
 local execName = tostring((pcall(identifyexecutor) and identifyexecutor()) or "Run")
 
 local function sendLog(msg, msgType)
-    if getgenv()._VSRX_LOGGING then return end
-    getgenv()._VSRX_LOGGING = true
-    
     task.spawn(function()
         pcall(function()
             local payload = HttpService:JSONEncode({
@@ -30,11 +27,13 @@ local function sendLog(msg, msgType)
                 HttpService:PostAsync(baseUrl .. "/log", payload)
             end
         end)
-        getgenv()._VSRX_LOGGING = false
     end)
 end
 
-if getgenv()._VSRX_CONSOLE_ENABLED then
+local function hookConsole()
+    if getgenv().VSRX_CONSOLE_HOOKED then return end
+    getgenv().VSRX_CONSOLE_HOOKED = true
+    
     task.spawn(function()
         pcall(function()
             local history = LogService:GetLogHistory()
@@ -48,6 +47,8 @@ if getgenv()._VSRX_CONSOLE_ENABLED then
     LogService.MessageOut:Connect(function(msg, msgType)
         sendLog(msg, msgType.Value)
     end)
+    
+    sendLog("VSRX Console Hooked (" .. execName .. ")", 1)
 end
 
 local function poll()
@@ -59,9 +60,19 @@ local function poll()
     end)
 
     if success and responseBody and #responseBody > 0 then
-        local data = HttpService:JSONDecode(responseBody)
+        local decodeSuccess, data = pcall(function()
+            return HttpService:JSONDecode(responseBody)
+        end)
+
+        if not decodeSuccess then return end
+
         local script = data.script
         local config = data.config or {}
+
+        -- Handle Console (New config-driven way)
+        if config.enableConsole then
+            hookConsole()
+        end
 
         if script and #script > 0 then
             local func, err = loadstring(script)
@@ -74,13 +85,34 @@ local function poll()
 
         if config.enableInternalUI then
             task.spawn(function()
-                local menuScript = game:HttpGet(baseUrl .. "/resources/scripts/iris_menu.lua")
-                if menuScript then
-                    loadstring(menuScript)()
-                    if config.showUIOnLoad then
-                        getgenv().VSRX_States.Opened:set(true)
+                if getgenv().VSRX_UI_LOADED or getgenv().VSRX_LOADING_UI then return end
+                getgenv().VSRX_LOADING_UI = true
+                
+                if not getgenv().Iris then
+                    local s1, irisSource = pcall(function() return game:HttpGet("https://raw.githubusercontent.com/x0581/Iris-Exploit-Bundle/main/bundle.lua") end)
+                    if s1 and irisSource then
+                        local factory, err = loadstring(irisSource)
+                        if factory then
+                            getgenv().Iris = factory()
+                            getgenv().Iris.Init(game:GetService("CoreGui"))
+                        end
                     end
                 end
+
+                if getgenv().Iris then
+                    local s2, menuScript = pcall(function() return game:HttpGet(baseUrl .. "/iris-menu") end)
+                    if s2 and menuScript then
+                        local func, err = loadstring(menuScript)
+                        if func then
+                            func()
+                            getgenv().VSRX_UI_LOADED = true
+                            if config.showUIOnLoad then
+                                getgenv().VSRX_States.Opened:set(true)
+                            end
+                        end
+                    end
+                end
+                getgenv().VSRX_LOADING_UI = false
             end)
         end
     end

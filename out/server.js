@@ -12,6 +12,7 @@ class VSRXServer {
         this.onLogReceived = null;
         this.consoleEnabled = true;
         this.internalUIEnabled = false;
+        this.showUIOnLoad = false;
         this.defaultSavePath = "";
         this.server = http.createServer((req, res) => this.handleRequest(req, res));
         setInterval(() => {
@@ -127,10 +128,18 @@ end`;
                     }
                 }
                 res.statusCode = 200;
-                res.setHeader('Content-Type', 'text/plain');
+                res.setHeader('Content-Type', 'application/json');
                 const script = client.pendingScript || '';
                 client.pendingScript = null;
-                res.end(script);
+                const responseData = {
+                    script: script,
+                    config: {
+                        enableConsole: this.consoleEnabled,
+                        enableInternalUI: this.internalUIEnabled,
+                        showUIOnLoad: this.showUIOnLoad
+                    }
+                };
+                res.end(JSON.stringify(responseData));
                 return;
             }
             if (url.pathname === '/saved-scripts') {
@@ -210,28 +219,9 @@ end`;
                     const scriptPath = path.join(__dirname, '..', 'resources', 'scripts', 'loader.lua');
                     if (fs.existsSync(scriptPath)) {
                         let content = fs.readFileSync(scriptPath, 'utf8');
-                        content = content.replace('baseUrl = getgenv().VSRX_IP', `baseUrl = getgenv().VSRX_IP or "http://${host}"`);
-                        const consoleCheck = `getgenv()._VSRX_CONSOLE_ENABLED = ${this.consoleEnabled}`;
-                        content = content.replace('-- {{CONSOLE_ENABLED_CHECK}}', consoleCheck);
-                        let irisBootstrap = "";
-                        if (this.internalUIEnabled) {
-                            irisBootstrap = `
-    task.spawn(function()
-        if not getgenv().Iris then
-            local irisSource = game:HttpGet("https://raw.githubusercontent.com/x0581/Iris-Exploit-Bundle/main/bundle.lua")
-            local factory, err = loadstring(irisSource)
-            if factory then
-                getgenv().Iris = factory()
-                getgenv().Iris.Init(game:GetService("CoreGui"))
-            else
-                warn("VSRX: Failed to load Iris Library: " .. tostring(err))
-                return
-            end
-        end
-        loadstring(game:HttpGet(baseUrl .. "/iris-menu"))()
-    end)`;
-                        }
-                        content = content.replace('-- {{IRIS_BOOTSTRAP_CHECK}}', irisBootstrap);
+                        // Simple baseUrl injection (fallback only)
+                        content = content.replace(/local baseUrl = getgenv\(\)\.VSRX_IP\s*/, `local baseUrl = getgenv().VSRX_IP or "http://${host}"\n`);
+                        // All other configs are handled via /fetch JSON poll
                         res.statusCode = 200;
                         res.setHeader('Content-Type', 'text/plain');
                         res.end(content);
@@ -282,7 +272,7 @@ end`;
                             });
                         }
                         res.statusCode = 200;
-                        res.end('Log received');
+                        res.end('OK');
                     }
                     catch (e) {
                         res.statusCode = 400;

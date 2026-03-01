@@ -104,6 +104,11 @@
                     "default": false,
                     "description": "[Roblox] Enable the Iris-based (ImGui) internal UI menu for management inside Roblox."
                 },
+                "vsrx.showUIOnLoad": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "[Roblox] Automatically show the internal UI when the loader script runs (instead of waiting for F1)."
+                },
                 "vsrx.defaultSavePath": {
                     "type": "string",
                     "default": "",

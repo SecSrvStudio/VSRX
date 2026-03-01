@@ -28,6 +28,7 @@ function activate(context) {
     const config = vscode.workspace.getConfiguration('vsrx');
     server.consoleEnabled = config.get('enableConsoleCapture') !== false;
     server.internalUIEnabled = config.get('enableInternalUI') === true;
+    server.showUIOnLoad = config.get('showUIOnLoad') === true;
     server.defaultSavePath = config.get('defaultSavePath') || "";
     if (server.consoleEnabled) {
         setupConsole();
@@ -112,6 +113,9 @@ function activate(context) {
         }
         if (e.affectsConfiguration('vsrx.enableInternalUI')) {
             server.internalUIEnabled = vscode.workspace.getConfiguration('vsrx').get('enableInternalUI') === true;
+        }
+        if (e.affectsConfiguration('vsrx.showUIOnLoad')) {
+            server.showUIOnLoad = vscode.workspace.getConfiguration('vsrx').get('showUIOnLoad') === true;
         }
         if (e.affectsConfiguration('vsrx.defaultSavePath')) {
             server.defaultSavePath = vscode.workspace.getConfiguration('vsrx').get('defaultSavePath') || "";
@@ -421,7 +425,7 @@ async function showScriptHub(query = '', page = 1) {
 }
 function setupConsole() {
     if (!robloxOutputChannel) {
-        robloxOutputChannel = vscode.window.createOutputChannel("Roblox Console", "log");
+        robloxOutputChannel = vscode.window.createOutputChannel("Roblox Console");
         robloxOutputChannel.appendLine("[info] VSRX: Roblox Output Console Started.");
     }
 }
@@ -454,6 +458,8 @@ function flushLogBuffer() {
         typeLabel = "error";
     const formattedMsg = `[${typeLabel}] [${logBuffer.playerName}] ${logBuffer.message}${countStr}`;
     robloxOutputChannel.appendLine(formattedMsg);
+    // Ensure channel is visible on first logs
+    robloxOutputChannel.show(true);
     logBuffer = null;
 }
 function logToConsole(message, type = 'info') {
