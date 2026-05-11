@@ -426,7 +426,6 @@ async function showScriptHub(query = '', page = 1) {
 function setupConsole() {
     if (!robloxOutputChannel) {
         robloxOutputChannel = vscode.window.createOutputChannel("Roblox Console");
-        robloxOutputChannel.appendLine("[info] VSRX: Roblox Output Console Started.");
     }
 }
 function queueLog(message, type, playerName) {

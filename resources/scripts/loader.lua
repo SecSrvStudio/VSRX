@@ -37,7 +37,7 @@ local function hookConsole()
     task.spawn(function()
         pcall(function()
             local history = LogService:GetLogHistory()
-            for i = math.max(1, #history - 15), #history do
+            for i = 1, #history do
                 local log = history[i]
                 sendLog(log.message .. " (History)", log.messageType.Value)
             end
@@ -69,7 +69,6 @@ local function poll()
         local script = data.script
         local config = data.config or {}
 
-        -- Handle Console (New config-driven way)
         if config.enableConsole then
             hookConsole()
         end

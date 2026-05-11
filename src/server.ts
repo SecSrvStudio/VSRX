@@ -70,20 +70,34 @@ export class VSRXServer {
     public getLoaderScript(): string {
         return `-- VSRX Smart Master Loader
 local ips = { "http://127.0.0.1:${this.port}", "http://10.0.2.2:${this.port}" }
-local found = false
-for _, ip in ipairs(ips) do
-    local s, r = pcall(function() return game:HttpGet(ip .. "/") end)
-    if s and r:find("VSRX") then 
-        getgenv().VSRX_IP = ip 
-        found = true 
-        break 
+local connected = false
+
+task.spawn(function()
+    while not connected do
+        for _, ip in ipairs(ips) do
+            local s, r = pcall(function() return game:HttpGet(ip .. "/") end)
+            if s and r and r:find("VSRX") then
+                getgenv().VSRX_IP = ip
+                connected = true
+                local ok, loaderSource = pcall(function()
+                    return game:HttpGet(getgenv().VSRX_IP .. "/loader")
+                end)
+                if ok and loaderSource then
+                    local fn, err = loadstring(loaderSource)
+                    if fn then
+                        fn()
+                    else
+                        warn("VSRX: Loader compile failed: " .. tostring(err))
+                    end
+                end
+                break
+            end
+        end
+        if not connected then
+            task.wait(1)
+        end
     end
-end
-if found then 
-    loadstring(game:HttpGet(getgenv().VSRX_IP .. "/loader"))() 
-else 
-    warn("VSRX: Could not connect to any server IP.") 
-end`;
+end)`;
     }
 
     public setClientExecution(clientId: string, enabled: boolean) {
