@@ -5,6 +5,33 @@ local playerName = (player and player.Name) or "Server"
 local playerUserId = (player and player.UserId) or 0
 local baseUrl = getgenv().VSRX_IP 
 local execName = tostring((pcall(identifyexecutor) and identifyexecutor()) or "Run")
+local nativeRequire = require
+
+local function runLoadedSource(source, label)
+    local wrappedSource = "local __VSRX_NATIVE_REQUIRE = require\nlocal function require(...)\n    return __VSRX_NATIVE_REQUIRE(...)\nend\n" .. source
+    local func, err = loadstring(wrappedSource)
+    if not func then
+        warn("VSRX " .. label .. " Load Error: " .. tostring(err))
+        return false
+    end
+
+    local env = getgenv()
+    if type(getfenv) == "function" and type(setfenv) == "function" then
+        local ok, currentEnv = pcall(getfenv, func)
+        if ok and type(currentEnv) == "table" then
+            env = currentEnv
+        end
+
+        env.require = function(...)
+            return nativeRequire(...)
+        end
+
+        pcall(setfenv, func, env)
+    end
+
+    task.spawn(func)
+    return true
+end
 
 local function sendLog(msg, msgType)
     task.spawn(function()
@@ -74,12 +101,7 @@ local function poll()
         end
 
         if script and #script > 0 then
-            local func, err = loadstring(script)
-            if func then
-                task.spawn(func)
-            else
-                warn("VSRX Load Error: " .. tostring(err))
-            end
+            runLoadedSource(script, "Script")
         end
 
         if config.enableInternalUI then

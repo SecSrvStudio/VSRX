@@ -4,6 +4,17 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { VSRXServer } from './server';
 
+interface RequireCall {
+    start: number;
+    end: number;
+    argumentSource: string;
+}
+
+interface SourceReplacement {
+    start: number;
+    end: number;
+    text: string;
+}
 let server: VSRXServer;
 let statusBarItem: vscode.StatusBarItem;
 let runButton: vscode.StatusBarItem;
@@ -215,9 +226,19 @@ function runScript() {
     }
     const source = editor.document.getText();
     const entryPath = editor.document.uri.scheme === 'file' ? editor.document.uri.fsPath : undefined;
-    const workspaceRoot = getProjectRoot(entryPath) || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
-    expandLocalRequires(source, entryPath, workspaceRoot, new Map<string, string>(), new Set<string>(), true)
+    void executeScript(source, entryPath);
+}
+
+async function executeScript(source: string, entryFilePath?: string) {
+    if (!source.trim()) {
+        vscode.window.showErrorMessage('VSRX: Script is empty.');
+        return;
+    }
+
+    const workspaceRoot = getProjectRoot(entryFilePath) || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+    expandLocalRequires(source, entryFilePath, workspaceRoot, new Map<string, string>(), new Set<string>(), true)
         .then(script => executeRawScript(script))
         .catch((error: any) => {
             vscode.window.showErrorMessage(`VSRX: Failed to resolve local require. ${error?.message || String(error)}`);
@@ -232,30 +253,32 @@ async function expandLocalRequires(
     loadingStack = new Set<string>(),
     wrapAsEntry = false
 ): Promise<string> {
-    const requirePattern = /require\(\s*(["'])(.+?)\1\s*\)/g;
     const currentDir = entryFilePath ? path.dirname(entryFilePath) : (vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '');
 
     const modules = new Map<string, string>();
-    const replacements = new Map<string, string>();
-    const matches = Array.from(source.matchAll(requirePattern));
+    const replacements: SourceReplacement[] = [];
+    const requireCalls = findRequireCalls(source);
 
-    for (const match of matches) {
-        const fullCall = match[0];
-        const requireTarget = match[2].trim();
+    for (const requireCall of requireCalls) {
+        const requireTarget = parseSimpleLuaStringArgument(requireCall.argumentSource)?.trim();
 
-        if (!requireTarget.startsWith('.')) {
+        if (!requireTarget || !requireTarget.startsWith('.')) {
             continue;
         }
 
         const resolvedPath = resolveLocalRequirePath(requireTarget, currentDir, workspaceRoot);
         if (!resolvedPath) {
-            continue;
+            throw new Error(`Required file not found: ${requireTarget}`);
         }
 
         const normalizedPath = normalizeModulePath(resolvedPath);
         if (moduleCache.has(normalizedPath)) {
             modules.set(normalizedPath, moduleCache.get(normalizedPath)!);
-            replacements.set(fullCall, `__VSRX_REQUIRE(${JSON.stringify(normalizedPath)})`);
+            replacements.push({
+                start: requireCall.start,
+                end: requireCall.end,
+                text: `__VSRX_REQUIRE(${JSON.stringify(normalizedPath)})`
+            });
             continue;
         }
 
@@ -274,7 +297,11 @@ async function expandLocalRequires(
 
             moduleCache.set(normalizedPath, moduleSource);
             modules.set(normalizedPath, moduleSource);
-            replacements.set(fullCall, `__VSRX_REQUIRE(${JSON.stringify(normalizedPath)})`);
+            replacements.push({
+                start: requireCall.start,
+                end: requireCall.end,
+                text: `__VSRX_REQUIRE(${JSON.stringify(normalizedPath)})`
+            });
         } finally {
             loadingStack.delete(normalizedPath);
         }
@@ -286,21 +313,326 @@ async function expandLocalRequires(
 
     const moduleWrapper = `local __VSRX_MODULES = {${moduleEntries}\n}\nlocal __VSRX_REQUIRE_CACHE = {}\nlocal function __VSRX_REQUIRE(modulePath)\n\tlocal cached = __VSRX_REQUIRE_CACHE[modulePath]\n\tif cached ~= nil then\n\t\treturn cached\n\tend\n\n\tlocal loader = __VSRX_MODULES[modulePath]\n\tif not loader then\n\t\terror(("VSRX: module not found: %s"):format(tostring(modulePath)), 2)\n\tend\n\n\tlocal result = loader()\n\tif result == nil then\n\t\tresult = true\n\tend\n\n\t__VSRX_REQUIRE_CACHE[modulePath] = result\n\treturn result\nend\n`;
 
-    let expandedSource = source;
-    for (const [needle, replacement] of replacements) {
-        expandedSource = expandedSource.split(needle).join(replacement);
-    }
-
-    expandedSource = expandedSource.replace(
-        /require\(\s*(game[^)]*)\s*\)/g,
-        '(function() return require($1) end)()'
-    );
+    const expandedSource = applySourceReplacements(source, replacements);
 
     if (wrapAsEntry) {
         return `(function()\n${moduleWrapper}\n${expandedSource}\nend)()`;
     }
 
     return `${moduleWrapper}\n${expandedSource}`;
+}
+
+function findRequireCalls(source: string): RequireCall[] {
+    const calls: RequireCall[] = [];
+    let index = 0;
+
+    while (index < source.length) {
+        const skippedIndex = skipIgnoredSegment(source, index);
+        if (skippedIndex !== index) {
+            index = skippedIndex;
+            continue;
+        }
+
+        if (source.startsWith('require', index)) {
+            const call = readRequireCall(source, index);
+            if (call) {
+                calls.push(call);
+                index = call.end;
+                continue;
+            }
+        }
+
+        index++;
+    }
+
+    return calls;
+}
+
+function readRequireCall(source: string, nameStart: number): RequireCall | null {
+    const nameEnd = nameStart + 'require'.length;
+    const previous = source.charAt(nameStart - 1);
+    const next = source.charAt(nameEnd);
+
+    if (isIdentifierChar(previous) || isIdentifierChar(next) || previous === '.' || previous === ':') {
+        return null;
+    }
+
+    const argumentStart = skipWhitespaceAndComments(source, nameEnd);
+    const argumentStartChar = source.charAt(argumentStart);
+
+    if (argumentStartChar === '(') {
+        const closeIndex = findMatchingParen(source, argumentStart);
+        if (closeIndex === null) {
+            return null;
+        }
+
+        return {
+            start: nameStart,
+            end: closeIndex + 1,
+            argumentSource: source.slice(argumentStart + 1, closeIndex)
+        };
+    }
+
+    if (argumentStartChar === '"' || argumentStartChar === "'") {
+        const end = skipQuotedString(source, argumentStart);
+        return {
+            start: nameStart,
+            end,
+            argumentSource: source.slice(argumentStart, end)
+        };
+    }
+
+    const longBracketEquals = getLongBracketEquals(source, argumentStart);
+    if (longBracketEquals !== null) {
+        const end = findLongBracketEnd(source, argumentStart, longBracketEquals);
+        return {
+            start: nameStart,
+            end,
+            argumentSource: source.slice(argumentStart, end)
+        };
+    }
+
+    return null;
+}
+
+function applySourceReplacements(source: string, replacements: SourceReplacement[]): string {
+    if (replacements.length === 0) {
+        return source;
+    }
+
+    const sorted = [...replacements].sort((a, b) => a.start - b.start);
+    let result = '';
+    let cursor = 0;
+
+    for (const replacement of sorted) {
+        if (replacement.start < cursor) {
+            continue;
+        }
+
+        result += source.slice(cursor, replacement.start);
+        result += replacement.text;
+        cursor = replacement.end;
+    }
+
+    return result + source.slice(cursor);
+}
+
+function skipWhitespaceAndComments(source: string, start: number): number {
+    let index = start;
+
+    while (index < source.length) {
+        if (/\s/.test(source.charAt(index))) {
+            index++;
+            continue;
+        }
+
+        if (source.charAt(index) === '-' && source.charAt(index + 1) === '-') {
+            index = skipComment(source, index);
+            continue;
+        }
+
+        break;
+    }
+
+    return index;
+}
+
+function skipIgnoredSegment(source: string, index: number): number {
+    const char = source.charAt(index);
+
+    if (char === '-' && source.charAt(index + 1) === '-') {
+        return skipComment(source, index);
+    }
+
+    if (char === '"' || char === "'") {
+        return skipQuotedString(source, index);
+    }
+
+    const longBracketEquals = getLongBracketEquals(source, index);
+    if (longBracketEquals !== null) {
+        return findLongBracketEnd(source, index, longBracketEquals);
+    }
+
+    return index;
+}
+
+function skipComment(source: string, index: number): number {
+    const longBracketEquals = getLongBracketEquals(source, index + 2);
+    if (longBracketEquals !== null) {
+        return findLongBracketEnd(source, index + 2, longBracketEquals);
+    }
+
+    const newline = source.indexOf('\n', index + 2);
+    return newline === -1 ? source.length : newline + 1;
+}
+
+function skipQuotedString(source: string, index: number): number {
+    const quote = source.charAt(index);
+    let cursor = index + 1;
+
+    while (cursor < source.length) {
+        const char = source.charAt(cursor);
+        if (char === '\\') {
+            cursor += 2;
+            continue;
+        }
+
+        if (char === quote) {
+            return cursor + 1;
+        }
+
+        cursor++;
+    }
+
+    return source.length;
+}
+
+function getLongBracketEquals(source: string, index: number): number | null {
+    if (source.charAt(index) !== '[') {
+        return null;
+    }
+
+    let cursor = index + 1;
+    while (source.charAt(cursor) === '=') {
+        cursor++;
+    }
+
+    return source.charAt(cursor) === '[' ? cursor - index - 1 : null;
+}
+
+function findLongBracketEnd(source: string, index: number, equalsCount: number): number {
+    const closeToken = `]${'='.repeat(equalsCount)}]`;
+    const contentStart = index + equalsCount + 2;
+    const closeIndex = source.indexOf(closeToken, contentStart);
+
+    return closeIndex === -1 ? source.length : closeIndex + closeToken.length;
+}
+
+function findMatchingParen(source: string, openIndex: number): number | null {
+    let depth = 1;
+    let index = openIndex + 1;
+
+    while (index < source.length) {
+        const skippedIndex = skipIgnoredSegment(source, index);
+        if (skippedIndex !== index) {
+            index = skippedIndex;
+            continue;
+        }
+
+        const char = source.charAt(index);
+        if (char === '(') {
+            depth++;
+        } else if (char === ')') {
+            depth--;
+            if (depth === 0) {
+                return index;
+            }
+        }
+
+        index++;
+    }
+
+    return null;
+}
+
+function parseSimpleLuaStringArgument(argumentSource: string): string | null {
+    const trimmed = argumentSource.trim();
+    if (!trimmed) {
+        return null;
+    }
+
+    const firstChar = trimmed.charAt(0);
+    if (firstChar === '"' || firstChar === "'") {
+        const end = skipQuotedString(trimmed, 0);
+        if (end !== trimmed.length) {
+            return null;
+        }
+
+        return decodeLuaQuotedString(trimmed.slice(1, -1));
+    }
+
+    const longBracketEquals = getLongBracketEquals(trimmed, 0);
+    if (longBracketEquals !== null) {
+        const end = findLongBracketEnd(trimmed, 0, longBracketEquals);
+        if (end !== trimmed.length) {
+            return null;
+        }
+
+        const tokenLength = longBracketEquals + 2;
+        return trimmed.slice(tokenLength, end - tokenLength);
+    }
+
+    return null;
+}
+
+function decodeLuaQuotedString(value: string): string {
+    let result = '';
+    let index = 0;
+
+    while (index < value.length) {
+        const char = value.charAt(index);
+        if (char !== '\\') {
+            result += char;
+            index++;
+            continue;
+        }
+
+        const next = value.charAt(index + 1);
+        switch (next) {
+            case 'n':
+                result += '\n';
+                index += 2;
+                break;
+            case 'r':
+                result += '\r';
+                index += 2;
+                break;
+            case 't':
+                result += '\t';
+                index += 2;
+                break;
+            case 'b':
+                result += '\b';
+                index += 2;
+                break;
+            case 'f':
+                result += '\f';
+                index += 2;
+                break;
+            case 'v':
+                result += '\v';
+                index += 2;
+                break;
+            case 'z':
+                index += 2;
+                while (/\s/.test(value.charAt(index))) {
+                    index++;
+                }
+                break;
+            case '\\':
+            case '"':
+            case "'":
+                result += next;
+                index += 2;
+                break;
+            default:
+                if (/\d/.test(next)) {
+                    const decimal = value.slice(index + 1).match(/^\d{1,3}/)?.[0] || '';
+                    result += String.fromCharCode(Number(decimal));
+                    index += 1 + decimal.length;
+                } else {
+                    result += next || '\\';
+                    index += next ? 2 : 1;
+                }
+                break;
+        }
+    }
+
+    return result;
+}
+
+function isIdentifierChar(char: string): boolean {
+    return /^[A-Za-z0-9_]$/.test(char);
 }
 
 function resolveLocalRequirePath(target: string, currentDir: string, workspaceRoot?: string): string | null {
@@ -320,7 +652,7 @@ function resolveLocalRequirePath(target: string, currentDir: string, workspaceRo
     ];
 
     for (const candidate of candidates) {
-        if (fs.existsSync(candidate)) {
+        if (fs.existsSync(candidate) && !fs.statSync(candidate).isDirectory()) {
             return candidate;
         }
     }
@@ -515,7 +847,7 @@ async function showSavedScripts() {
                 vscode.env.openExternal(vscode.Uri.file((selected as any).fullPath));
             } else {
                 const scriptContent = fs.readFileSync((selected as any).fullPath, 'utf8');
-                executeRawScript(scriptContent);
+                void executeScript(scriptContent, (selected as any).fullPath);
             }
         }
     } catch (e: any) {
@@ -607,7 +939,7 @@ async function showScriptHub(query: string = '', page: number = 1) {
                             showScriptHub(query, page - 1);
                         } else if (action === 'run') {
                             // @ts-ignore
-                            executeRawScript(selected.scriptCode);
+                            void executeScript(selected.scriptCode);
                         }
                     }
 
