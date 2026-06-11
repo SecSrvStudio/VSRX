@@ -1,8 +1,10 @@
 .vscode/**
 node_modules/**
 src/**
-*.vsix
+.vsrx-debug-*
+test.lua
 tsconfig.json
 package-lock.json
 .gitignore
 .vscodeignore
+*.vsix

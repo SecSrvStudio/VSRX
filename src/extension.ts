@@ -2,19 +2,9 @@ import * as vscode from 'vscode';
 import * as http from 'http';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as https from 'https';
 import { VSRXServer } from './server';
 
-interface RequireCall {
-    start: number;
-    end: number;
-    argumentSource: string;
-}
-
-interface SourceReplacement {
-    start: number;
-    end: number;
-    text: string;
-}
 let server: VSRXServer;
 let statusBarItem: vscode.StatusBarItem;
 let runButton: vscode.StatusBarItem;
@@ -24,7 +14,6 @@ let robloxOutputChannel: vscode.OutputChannel | undefined;
 let logBuffer: { message: string, type: number, playerName: string, count: number } | null = null;
 let logBufferTimeout: NodeJS.Timeout | null = null;
 let lastStatusBarCount = -1;
-import * as https from 'https';
 
 function notify(msg: string) {
     const config = vscode.workspace.getConfiguration('vsrx');
@@ -224,491 +213,55 @@ function runScript() {
         vscode.window.showErrorMessage('VSRX: No active script to run.');
         return;
     }
-    const source = editor.document.getText();
-    const entryPath = editor.document.uri.scheme === 'file' ? editor.document.uri.fsPath : undefined;
-
-    void executeScript(source, entryPath);
+    const sourcePath = editor.document.uri.scheme === 'file' ? editor.document.uri.fsPath : undefined;
+    executeRawScript(editor.document.getText(), sourcePath);
 }
 
-async function executeScript(source: string, entryFilePath?: string) {
-    if (!source.trim()) {
-        vscode.window.showErrorMessage('VSRX: Script is empty.');
-        return;
-    }
-
-    const workspaceRoot = getProjectRoot(entryFilePath) || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-
-    expandLocalRequires(source, entryFilePath, workspaceRoot, new Map<string, string>(), new Set<string>(), true)
-        .then(script => executeRawScript(script))
-        .catch((error: any) => {
-            vscode.window.showErrorMessage(`VSRX: Failed to resolve local require. ${error?.message || String(error)}`);
-        });
+interface LocalRequireModule {
+    id: string;
+    filePath: string;
+    source: string;
 }
 
-async function expandLocalRequires(
-    source: string,
-    entryFilePath?: string,
-    workspaceRoot?: string,
-    moduleCache = new Map<string, string>(),
-    loadingStack = new Set<string>(),
-    wrapAsEntry = false
-): Promise<string> {
-    const currentDir = entryFilePath ? path.dirname(entryFilePath) : (vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '');
-
-    const modules = new Map<string, string>();
-    const replacements: SourceReplacement[] = [];
-    const requireCalls = findRequireCalls(source);
-
-    for (const requireCall of requireCalls) {
-        const requireTarget = parseSimpleLuaStringArgument(requireCall.argumentSource)?.trim();
-
-        if (!requireTarget || !requireTarget.startsWith('.')) {
-            continue;
-        }
-
-        const resolvedPath = resolveLocalRequirePath(requireTarget, currentDir, workspaceRoot);
-        if (!resolvedPath) {
-            throw new Error(`Required file not found: ${requireTarget}`);
-        }
-
-        const normalizedPath = normalizeModulePath(resolvedPath);
-        if (moduleCache.has(normalizedPath)) {
-            modules.set(normalizedPath, moduleCache.get(normalizedPath)!);
-            replacements.push({
-                start: requireCall.start,
-                end: requireCall.end,
-                text: `__VSRX_REQUIRE(${JSON.stringify(normalizedPath)})`
-            });
-            continue;
-        }
-
-        if (loadingStack.has(normalizedPath)) {
-            throw new Error(`Circular require detected: ${normalizedPath}`);
-        }
-
-        if (!fs.existsSync(normalizedPath) || fs.statSync(normalizedPath).isDirectory()) {
-            throw new Error(`Required file not found: ${requireTarget}`);
-        }
-
-        loadingStack.add(normalizedPath);
-        try {
-            let moduleSource = fs.readFileSync(normalizedPath, 'utf8');
-            moduleSource = await expandLocalRequires(moduleSource, normalizedPath, workspaceRoot, moduleCache, loadingStack, false);
-
-            moduleCache.set(normalizedPath, moduleSource);
-            modules.set(normalizedPath, moduleSource);
-            replacements.push({
-                start: requireCall.start,
-                end: requireCall.end,
-                text: `__VSRX_REQUIRE(${JSON.stringify(normalizedPath)})`
-            });
-        } finally {
-            loadingStack.delete(normalizedPath);
-        }
-    }
-
-    const moduleEntries = Array.from(modules.entries())
-        .map(([modulePath, moduleSource]) => `\n\t[${JSON.stringify(modulePath)}] = function()\n${indentScript(moduleSource, 2)}\n\tend,`)
-        .join('');
-
-    const moduleWrapper = `local __VSRX_MODULES = {${moduleEntries}\n}\nlocal __VSRX_REQUIRE_CACHE = {}\nlocal function __VSRX_REQUIRE(modulePath)\n\tlocal cached = __VSRX_REQUIRE_CACHE[modulePath]\n\tif cached ~= nil then\n\t\treturn cached\n\tend\n\n\tlocal loader = __VSRX_MODULES[modulePath]\n\tif not loader then\n\t\terror(("VSRX: module not found: %s"):format(tostring(modulePath)), 2)\n\tend\n\n\tlocal result = loader()\n\tif result == nil then\n\t\tresult = true\n\tend\n\n\t__VSRX_REQUIRE_CACHE[modulePath] = result\n\treturn result\nend\n`;
-
-    const expandedSource = applySourceReplacements(source, replacements);
-
-    if (wrapAsEntry) {
-        return `(function()\n${moduleWrapper}\n${expandedSource}\nend)()`;
-    }
-
-    return `${moduleWrapper}\n${expandedSource}`;
+interface LocalRequireBundleContext {
+    modules: Map<string, LocalRequireModule>;
+    resolutions: Map<string, Map<string, string>>;
+    workspaceRoots: string[];
+    warnings: string[];
+    warningKeys: Set<string>;
 }
 
-function findRequireCalls(source: string): RequireCall[] {
-    const calls: RequireCall[] = [];
-    let index = 0;
-
-    while (index < source.length) {
-        const skippedIndex = skipIgnoredSegment(source, index);
-        if (skippedIndex !== index) {
-            index = skippedIndex;
-            continue;
-        }
-
-        if (source.startsWith('require', index)) {
-            const call = readRequireCall(source, index);
-            if (call) {
-                calls.push(call);
-                index = call.end;
-                continue;
-            }
-        }
-
-        index++;
-    }
-
-    return calls;
+interface LocalRequireBundleResult {
+    script: string;
+    moduleCount: number;
+    warnings: string[];
 }
 
-function readRequireCall(source: string, nameStart: number): RequireCall | null {
-    const nameEnd = nameStart + 'require'.length;
-    const previous = source.charAt(nameStart - 1);
-    const next = source.charAt(nameEnd);
+const VSRX_ENTRY_MODULE_ID = '@vsrx/entry';
 
-    if (isIdentifierChar(previous) || isIdentifierChar(next) || previous === '.' || previous === ':') {
-        return null;
-    }
-
-    const argumentStart = skipWhitespaceAndComments(source, nameEnd);
-    const argumentStartChar = source.charAt(argumentStart);
-
-    if (argumentStartChar === '(') {
-        const closeIndex = findMatchingParen(source, argumentStart);
-        if (closeIndex === null) {
-            return null;
-        }
-
-        return {
-            start: nameStart,
-            end: closeIndex + 1,
-            argumentSource: source.slice(argumentStart + 1, closeIndex)
-        };
-    }
-
-    if (argumentStartChar === '"' || argumentStartChar === "'") {
-        const end = skipQuotedString(source, argumentStart);
-        return {
-            start: nameStart,
-            end,
-            argumentSource: source.slice(argumentStart, end)
-        };
-    }
-
-    const longBracketEquals = getLongBracketEquals(source, argumentStart);
-    if (longBracketEquals !== null) {
-        const end = findLongBracketEnd(source, argumentStart, longBracketEquals);
-        return {
-            start: nameStart,
-            end,
-            argumentSource: source.slice(argumentStart, end)
-        };
-    }
-
-    return null;
-}
-
-function applySourceReplacements(source: string, replacements: SourceReplacement[]): string {
-    if (replacements.length === 0) {
-        return source;
-    }
-
-    const sorted = [...replacements].sort((a, b) => a.start - b.start);
-    let result = '';
-    let cursor = 0;
-
-    for (const replacement of sorted) {
-        if (replacement.start < cursor) {
-            continue;
-        }
-
-        result += source.slice(cursor, replacement.start);
-        result += replacement.text;
-        cursor = replacement.end;
-    }
-
-    return result + source.slice(cursor);
-}
-
-function skipWhitespaceAndComments(source: string, start: number): number {
-    let index = start;
-
-    while (index < source.length) {
-        if (/\s/.test(source.charAt(index))) {
-            index++;
-            continue;
-        }
-
-        if (source.charAt(index) === '-' && source.charAt(index + 1) === '-') {
-            index = skipComment(source, index);
-            continue;
-        }
-
-        break;
-    }
-
-    return index;
-}
-
-function skipIgnoredSegment(source: string, index: number): number {
-    const char = source.charAt(index);
-
-    if (char === '-' && source.charAt(index + 1) === '-') {
-        return skipComment(source, index);
-    }
-
-    if (char === '"' || char === "'") {
-        return skipQuotedString(source, index);
-    }
-
-    const longBracketEquals = getLongBracketEquals(source, index);
-    if (longBracketEquals !== null) {
-        return findLongBracketEnd(source, index, longBracketEquals);
-    }
-
-    return index;
-}
-
-function skipComment(source: string, index: number): number {
-    const longBracketEquals = getLongBracketEquals(source, index + 2);
-    if (longBracketEquals !== null) {
-        return findLongBracketEnd(source, index + 2, longBracketEquals);
-    }
-
-    const newline = source.indexOf('\n', index + 2);
-    return newline === -1 ? source.length : newline + 1;
-}
-
-function skipQuotedString(source: string, index: number): number {
-    const quote = source.charAt(index);
-    let cursor = index + 1;
-
-    while (cursor < source.length) {
-        const char = source.charAt(cursor);
-        if (char === '\\') {
-            cursor += 2;
-            continue;
-        }
-
-        if (char === quote) {
-            return cursor + 1;
-        }
-
-        cursor++;
-    }
-
-    return source.length;
-}
-
-function getLongBracketEquals(source: string, index: number): number | null {
-    if (source.charAt(index) !== '[') {
-        return null;
-    }
-
-    let cursor = index + 1;
-    while (source.charAt(cursor) === '=') {
-        cursor++;
-    }
-
-    return source.charAt(cursor) === '[' ? cursor - index - 1 : null;
-}
-
-function findLongBracketEnd(source: string, index: number, equalsCount: number): number {
-    const closeToken = `]${'='.repeat(equalsCount)}]`;
-    const contentStart = index + equalsCount + 2;
-    const closeIndex = source.indexOf(closeToken, contentStart);
-
-    return closeIndex === -1 ? source.length : closeIndex + closeToken.length;
-}
-
-function findMatchingParen(source: string, openIndex: number): number | null {
-    let depth = 1;
-    let index = openIndex + 1;
-
-    while (index < source.length) {
-        const skippedIndex = skipIgnoredSegment(source, index);
-        if (skippedIndex !== index) {
-            index = skippedIndex;
-            continue;
-        }
-
-        const char = source.charAt(index);
-        if (char === '(') {
-            depth++;
-        } else if (char === ')') {
-            depth--;
-            if (depth === 0) {
-                return index;
-            }
-        }
-
-        index++;
-    }
-
-    return null;
-}
-
-function parseSimpleLuaStringArgument(argumentSource: string): string | null {
-    const trimmed = argumentSource.trim();
-    if (!trimmed) {
-        return null;
-    }
-
-    const firstChar = trimmed.charAt(0);
-    if (firstChar === '"' || firstChar === "'") {
-        const end = skipQuotedString(trimmed, 0);
-        if (end !== trimmed.length) {
-            return null;
-        }
-
-        return decodeLuaQuotedString(trimmed.slice(1, -1));
-    }
-
-    const longBracketEquals = getLongBracketEquals(trimmed, 0);
-    if (longBracketEquals !== null) {
-        const end = findLongBracketEnd(trimmed, 0, longBracketEquals);
-        if (end !== trimmed.length) {
-            return null;
-        }
-
-        const tokenLength = longBracketEquals + 2;
-        return trimmed.slice(tokenLength, end - tokenLength);
-    }
-
-    return null;
-}
-
-function decodeLuaQuotedString(value: string): string {
-    let result = '';
-    let index = 0;
-
-    while (index < value.length) {
-        const char = value.charAt(index);
-        if (char !== '\\') {
-            result += char;
-            index++;
-            continue;
-        }
-
-        const next = value.charAt(index + 1);
-        switch (next) {
-            case 'n':
-                result += '\n';
-                index += 2;
-                break;
-            case 'r':
-                result += '\r';
-                index += 2;
-                break;
-            case 't':
-                result += '\t';
-                index += 2;
-                break;
-            case 'b':
-                result += '\b';
-                index += 2;
-                break;
-            case 'f':
-                result += '\f';
-                index += 2;
-                break;
-            case 'v':
-                result += '\v';
-                index += 2;
-                break;
-            case 'z':
-                index += 2;
-                while (/\s/.test(value.charAt(index))) {
-                    index++;
-                }
-                break;
-            case '\\':
-            case '"':
-            case "'":
-                result += next;
-                index += 2;
-                break;
-            default:
-                if (/\d/.test(next)) {
-                    const decimal = value.slice(index + 1).match(/^\d{1,3}/)?.[0] || '';
-                    result += String.fromCharCode(Number(decimal));
-                    index += 1 + decimal.length;
-                } else {
-                    result += next || '\\';
-                    index += next ? 2 : 1;
-                }
-                break;
-        }
-    }
-
-    return result;
-}
-
-function isIdentifierChar(char: string): boolean {
-    return /^[A-Za-z0-9_]$/.test(char);
-}
-
-function resolveLocalRequirePath(target: string, currentDir: string, workspaceRoot?: string): string | null {
-    const sanitized = target.replace(/^\.\//, '').replace(/^\.\\/, '');
-    const shouldTryWorkspaceRoot = workspaceRoot && (target.startsWith('./') || target.startsWith('.\\'));
-    const candidates = [
-        ...(shouldTryWorkspaceRoot ? [
-            path.resolve(workspaceRoot, target),
-            path.resolve(workspaceRoot, sanitized),
-            path.resolve(workspaceRoot, `${sanitized}.luau`),
-            path.resolve(workspaceRoot, `${sanitized}.lua`)
-        ] : []),
-        path.resolve(currentDir, target),
-        path.resolve(currentDir, sanitized),
-        path.resolve(currentDir, `${sanitized}.luau`),
-        path.resolve(currentDir, `${sanitized}.lua`)
-    ];
-
-    for (const candidate of candidates) {
-        if (fs.existsSync(candidate) && !fs.statSync(candidate).isDirectory()) {
-            return candidate;
-        }
-    }
-
-    return null;
-}
-
-function getProjectRoot(entryFilePath?: string): string | undefined {
-    if (!entryFilePath) {
-        return undefined;
-    }
-
-    const containingWorkspace = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(entryFilePath));
-    if (containingWorkspace) {
-        return containingWorkspace.uri.fsPath;
-    }
-
-    let current = path.dirname(entryFilePath);
-    while (true) {
-        if (
-            fs.existsSync(path.join(current, '.luaurc')) ||
-            fs.existsSync(path.join(current, 'default.project.json')) ||
-            fs.existsSync(path.join(current, 'package.json')) ||
-            fs.existsSync(path.join(current, '.git'))
-        ) {
-            return current;
-        }
-
-        const parent = path.dirname(current);
-        if (parent === current) {
-            return path.dirname(entryFilePath);
-        }
-        current = parent;
-    }
-}
-
-function normalizeModulePath(filePath: string): string {
-    const normalized = path.normalize(filePath);
-    return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
-}
-
-function indentScript(script: string, level: number): string {
-    const indent = '\t'.repeat(level);
-    return script
-        .split(/\r?\n/)
-        .map(line => line.length > 0 ? `${indent}${line}` : '')
-        .join('\n');
-}
-
-function executeRawScript(script: string) {
+function executeRawScript(script: string, sourcePath?: string) {
     if (!script.trim()) {
         vscode.window.showErrorMessage('VSRX: Script is empty.');
         return;
     }
 
-    const payload = JSON.stringify({ script });
+    let executableScript = script;
+    let bundledModuleCount = 0;
+    try {
+        const bundled = bundleLocalRequires(script, sourcePath);
+        executableScript = bundled.script;
+        bundledModuleCount = bundled.moduleCount;
+
+        if (bundled.warnings.length > 0) {
+            const preview = bundled.warnings.slice(0, 3).join(' | ');
+            vscode.window.showWarningMessage(`VSRX: Some local require paths could not be linked. ${preview}`);
+        }
+    } catch (error: any) {
+        vscode.window.showErrorMessage(`VSRX: Failed to prepare local require runtime. ${error.message}`);
+        return;
+    }
+
+    const payload = JSON.stringify({ script: executableScript });
     const requestOptions = {
         hostname: '127.0.0.1',
         port: 6732,
@@ -727,7 +280,10 @@ function executeRawScript(script: string) {
             if (res.statusCode === 200) {
                 try {
                     const parsed = JSON.parse(data);
-                    notify(`VSRX: Script executed on ${parsed.queued} client(s).`);
+                    const bundleSuffix = bundledModuleCount > 0
+                        ? ` (${bundledModuleCount} local module${bundledModuleCount === 1 ? '' : 's'} linked)`
+                        : '';
+                    notify(`VSRX: Script executed on ${parsed.queued} client(s).${bundleSuffix}`);
                 } catch {
                     notify('VSRX: Script executed successfully.');
                 }
@@ -743,6 +299,645 @@ function executeRawScript(script: string) {
 
     req.write(payload);
     req.end();
+}
+
+function bundleLocalRequires(script: string, sourcePath?: string): LocalRequireBundleResult {
+    if (!sourcePath) {
+        return { script, moduleCount: 0, warnings: [] };
+    }
+
+    if (!script.includes('require')) {
+        return { script, moduleCount: 0, warnings: [] };
+    }
+
+    const entryPath = path.resolve(sourcePath);
+    const workspaceRoots = getWorkspaceRootsForFile(entryPath);
+    const context: LocalRequireBundleContext = {
+        modules: new Map<string, LocalRequireModule>(),
+        resolutions: new Map<string, Map<string, string>>(),
+        workspaceRoots,
+        warnings: [],
+        warningKeys: new Set<string>()
+    };
+
+    scanLocalRequires(script, entryPath, VSRX_ENTRY_MODULE_ID, context);
+
+    if (context.modules.size === 0) {
+        return { script, moduleCount: 0, warnings: context.warnings };
+    }
+
+    return {
+        script: createLocalRequireBundle(script, context),
+        moduleCount: context.modules.size,
+        warnings: context.warnings
+    };
+}
+
+function scanLocalRequires(source: string, importerPath: string, callerId: string, context: LocalRequireBundleContext) {
+    const requests = findStaticRequireRequests(source);
+    if (requests.length === 0) {
+        return;
+    }
+
+    const callerResolutions = getOrCreateResolutionMap(context, callerId);
+
+    for (const request of requests) {
+        if (!isLocalRequirePath(request)) {
+            continue;
+        }
+
+        const resolvedPath = resolveLocalRequirePath(request, importerPath, context.workspaceRoots);
+        if (!resolvedPath) {
+            if (isExplicitRelativeRequirePath(request)) {
+                addBundleWarning(context, `Cannot resolve '${request}' from '${toModuleId(importerPath, context.workspaceRoots)}'`);
+            }
+            continue;
+        }
+
+        const moduleId = toModuleId(resolvedPath, context.workspaceRoots);
+        callerResolutions.set(request, moduleId);
+
+        const moduleKey = canonicalFileKey(resolvedPath);
+        if (context.modules.has(moduleKey)) {
+            continue;
+        }
+
+        const moduleSource = readLocalScriptFile(resolvedPath);
+        context.modules.set(moduleKey, {
+            id: moduleId,
+            filePath: resolvedPath,
+            source: moduleSource
+        });
+
+        scanLocalRequires(moduleSource, resolvedPath, moduleId, context);
+    }
+}
+
+function findStaticRequireRequests(source: string): string[] {
+    const requests: string[] = [];
+    let index = 0;
+
+    while (index < source.length) {
+        const skippedSyntax = skipLuaIgnoredSyntax(source, index);
+        if (skippedSyntax > index) {
+            index = skippedSyntax;
+            continue;
+        }
+
+        if (!isRequireIdentifierAt(source, index)) {
+            index++;
+            continue;
+        }
+
+        let cursor = index + 'require'.length;
+        cursor = skipLuaWhitespaceAndComments(source, cursor);
+
+        const directString = parseLuaStringAt(source, cursor);
+        if (directString) {
+            requests.push(directString.value);
+            index = directString.end;
+            continue;
+        }
+
+        if (source[cursor] !== '(') {
+            index++;
+            continue;
+        }
+
+        cursor = skipLuaWhitespaceAndComments(source, cursor + 1);
+        const parsedString = parseLuaStringAt(source, cursor);
+        if (!parsedString) {
+            index++;
+            continue;
+        }
+
+        cursor = skipLuaWhitespaceAndComments(source, parsedString.end);
+        if (source[cursor] === ')') {
+            requests.push(parsedString.value);
+            index = cursor + 1;
+            continue;
+        }
+
+        index++;
+    }
+
+    return requests;
+}
+
+interface ParsedLuaString {
+    value: string;
+    end: number;
+}
+
+interface LuaLongBracketStart {
+    equals: string;
+    contentStart: number;
+}
+
+function isRequireIdentifierAt(source: string, index: number): boolean {
+    if (!source.startsWith('require', index)) {
+        return false;
+    }
+
+    const before = index > 0 ? source[index - 1] : '';
+    const after = source[index + 'require'.length] ?? '';
+
+    return !isLuaIdentifierCharacter(before)
+        && before !== '.'
+        && before !== ':'
+        && !isLuaIdentifierCharacter(after);
+}
+
+function isLuaIdentifierCharacter(character: string): boolean {
+    return /^[A-Za-z0-9_]$/.test(character);
+}
+
+function skipLuaIgnoredSyntax(source: string, index: number): number {
+    if (source.startsWith('--', index)) {
+        return skipLuaComment(source, index);
+    }
+
+    const character = source[index];
+    if (character === '"' || character === "'") {
+        return parseLuaQuotedStringAt(source, index)?.end ?? source.length;
+    }
+
+    const longBracket = readLuaLongBracketStart(source, index);
+    if (longBracket) {
+        return findLuaLongBracketEnd(source, longBracket);
+    }
+
+    return index;
+}
+
+function skipLuaWhitespaceAndComments(source: string, index: number): number {
+    let cursor = index;
+
+    while (cursor < source.length) {
+        while (cursor < source.length && /\s/.test(source[cursor])) {
+            cursor++;
+        }
+
+        if (source.startsWith('--', cursor)) {
+            cursor = skipLuaComment(source, cursor);
+            continue;
+        }
+
+        break;
+    }
+
+    return cursor;
+}
+
+function skipLuaComment(source: string, index: number): number {
+    const longBracket = readLuaLongBracketStart(source, index + 2);
+    if (longBracket) {
+        return findLuaLongBracketEnd(source, longBracket);
+    }
+
+    const lineEnd = source.indexOf('\n', index + 2);
+    return lineEnd === -1 ? source.length : lineEnd + 1;
+}
+
+function parseLuaStringAt(source: string, index: number): ParsedLuaString | null {
+    const character = source[index];
+    if (character === '"' || character === "'") {
+        return parseLuaQuotedStringAt(source, index);
+    }
+
+    const longBracket = readLuaLongBracketStart(source, index);
+    if (!longBracket) {
+        return null;
+    }
+
+    const closingIndex = findLuaLongBracketClosingIndex(source, longBracket);
+    const contentEnd = closingIndex === -1 ? source.length : closingIndex;
+    const end = closingIndex === -1 ? source.length : closingIndex + longBracket.equals.length + 2;
+    return {
+        value: source.slice(longBracket.contentStart, contentEnd),
+        end
+    };
+}
+
+function parseLuaQuotedStringAt(source: string, index: number): ParsedLuaString | null {
+    const quote = source[index];
+    let cursor = index + 1;
+    let value = '';
+
+    while (cursor < source.length) {
+        const character = source[cursor];
+
+        if (character === quote) {
+            return { value, end: cursor + 1 };
+        }
+
+        if (character === '\\') {
+            const escape = readLuaEscape(source, cursor);
+            value += escape.value;
+            cursor = escape.end;
+            continue;
+        }
+
+        value += character;
+        cursor++;
+    }
+
+    return null;
+}
+
+function readLuaEscape(source: string, index: number): ParsedLuaString {
+    const escaped = source[index + 1];
+
+    if (!escaped) {
+        return { value: '\\', end: index + 1 };
+    }
+
+    const escapes: { [key: string]: string } = {
+        '\\': '\\',
+        '"': '"',
+        "'": "'",
+        a: '\x07',
+        b: '\b',
+        f: '\f',
+        n: '\n',
+        r: '\r',
+        t: '\t',
+        v: '\x0b'
+    };
+
+    if (escapes[escaped] !== undefined) {
+        return { value: escapes[escaped], end: index + 2 };
+    }
+
+    if (escaped === '\r' || escaped === '\n') {
+        const end = escaped === '\r' && source[index + 2] === '\n' ? index + 3 : index + 2;
+        return { value: '', end };
+    }
+
+    if (escaped === 'z') {
+        let cursor = index + 2;
+        while (cursor < source.length && /\s/.test(source[cursor])) {
+            cursor++;
+        }
+        return { value: '', end: cursor };
+    }
+
+    if (escaped === 'x') {
+        const hex = source.slice(index + 2, index + 4);
+        if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+            return { value: String.fromCharCode(parseInt(hex, 16)), end: index + 4 };
+        }
+    }
+
+    if (escaped === 'u' && source[index + 2] === '{') {
+        const endBrace = source.indexOf('}', index + 3);
+        if (endBrace !== -1) {
+            const codePoint = source.slice(index + 3, endBrace);
+            if (/^[0-9a-fA-F]+$/.test(codePoint)) {
+                return { value: String.fromCodePoint(parseInt(codePoint, 16)), end: endBrace + 1 };
+            }
+        }
+    }
+
+    if (/\d/.test(escaped)) {
+        const decimal = source.slice(index + 1).match(/^\d{1,3}/)?.[0] ?? escaped;
+        return { value: String.fromCharCode(parseInt(decimal, 10)), end: index + 1 + decimal.length };
+    }
+
+    return { value: escaped, end: index + 2 };
+}
+
+function readLuaLongBracketStart(source: string, index: number): LuaLongBracketStart | null {
+    if (source[index] !== '[') {
+        return null;
+    }
+
+    let cursor = index + 1;
+    while (source[cursor] === '=') {
+        cursor++;
+    }
+
+    if (source[cursor] !== '[') {
+        return null;
+    }
+
+    return {
+        equals: source.slice(index + 1, cursor),
+        contentStart: cursor + 1
+    };
+}
+
+function findLuaLongBracketEnd(source: string, bracket: LuaLongBracketStart): number {
+    const closingIndex = findLuaLongBracketClosingIndex(source, bracket);
+    return closingIndex === -1 ? source.length : closingIndex + bracket.equals.length + 2;
+}
+
+function findLuaLongBracketClosingIndex(source: string, bracket: LuaLongBracketStart): number {
+    const closing = `]${bracket.equals}]`;
+    return source.indexOf(closing, bracket.contentStart);
+}
+
+function isLocalRequirePath(request: string): boolean {
+    const normalized = request.replace(/\\/g, '/');
+    return isExplicitRelativeRequirePath(request)
+        || normalized.includes('/');
+}
+
+function isExplicitRelativeRequirePath(request: string): boolean {
+    const normalized = request.replace(/\\/g, '/');
+    return normalized.startsWith('./')
+        || normalized.startsWith('../')
+        || normalized.startsWith('/')
+        || /^[a-zA-Z]:\//.test(normalized);
+}
+
+function resolveLocalRequirePath(request: string, importerPath: string, workspaceRoots: string[]): string | null {
+    const candidates: string[] = [];
+    const normalizedRequest = request.replace(/\\/g, '/');
+    const requestAsPath = normalizedRequest.replace(/\//g, path.sep);
+
+    if (/^[a-zA-Z]:\//.test(normalizedRequest) || (path.isAbsolute(requestAsPath) && !normalizedRequest.startsWith('/'))) {
+        candidates.push(path.resolve(requestAsPath));
+    } else if (normalizedRequest.startsWith('/')) {
+        const projectRelativePath = normalizedRequest.replace(/^\/+/, '').replace(/\//g, path.sep);
+        for (const root of workspaceRoots) {
+            candidates.push(path.resolve(root, projectRelativePath));
+        }
+    } else {
+        candidates.push(path.resolve(path.dirname(importerPath), requestAsPath));
+        for (const root of workspaceRoots) {
+            candidates.push(path.resolve(root, requestAsPath));
+        }
+    }
+
+    for (const candidate of uniquePaths(candidates)) {
+        const resolved = resolveScriptFile(candidate);
+        if (resolved && isPathInsideAnyRoot(resolved, workspaceRoots)) {
+            return resolved;
+        }
+    }
+
+    return null;
+}
+
+function resolveScriptFile(basePath: string): string | null {
+    const extension = path.extname(basePath).toLowerCase();
+    const candidates = extension === '.lua' || extension === '.luau'
+        ? [basePath]
+        : [
+            `${basePath}.luau`,
+            `${basePath}.lua`,
+            path.join(basePath, 'init.luau'),
+            path.join(basePath, 'init.lua')
+        ];
+
+    for (const candidate of candidates) {
+        try {
+            if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+                return path.resolve(candidate);
+            }
+        } catch {
+            // Ignore inaccessible candidates and continue trying the rest.
+        }
+    }
+
+    return null;
+}
+
+function readLocalScriptFile(filePath: string): string {
+    const openDocument = vscode.workspace.textDocuments.find(document =>
+        document.uri.scheme === 'file' && canonicalFileKey(document.uri.fsPath) === canonicalFileKey(filePath)
+    );
+
+    if (openDocument) {
+        return openDocument.getText();
+    }
+
+    return fs.readFileSync(filePath, 'utf8');
+}
+
+function createLocalRequireBundle(entryScript: string, context: LocalRequireBundleContext): string {
+    const modules = Array.from(context.modules.values());
+    const moduleSources = [
+        `local __vsrx_module_sources = {`,
+        ...modules.map(module => `    [${toLuaString(module.id)}] = ${toLuaString(module.source)},`),
+        `}`
+    ].join('\n');
+
+    return [
+        `-- VSRX local require runtime (generated by VS Code)`,
+        `return (function()`,
+        `local __vsrx_native_require = require`,
+        `local __vsrx_entry_source = ${toLuaString(entryScript)}`,
+        moduleSources,
+        createResolutionTable(context),
+        `local __vsrx_cache = {}`,
+        `local __vsrx_base_env = (getfenv and getfenv(0)) or (getgenv and getgenv()) or _G`,
+        `local __vsrx_require_from`,
+        ``,
+        `local function __vsrx_load_source(__vsrx_source, __vsrx_name)`,
+        `    local __vsrx_fn, __vsrx_err`,
+        `    local __vsrx_loaded = pcall(function()`,
+        `        __vsrx_fn, __vsrx_err = loadstring(__vsrx_source, "=" .. tostring(__vsrx_name))`,
+        `    end)`,
+        `    if (not __vsrx_loaded) or (not __vsrx_fn) then`,
+        `        __vsrx_fn, __vsrx_err = loadstring(__vsrx_source)`,
+        `    end`,
+        `    if not __vsrx_fn then`,
+        `        error("VSRX local require compile error in " .. tostring(__vsrx_name) .. ": " .. tostring(__vsrx_err), 2)`,
+        `    end`,
+        `    return __vsrx_fn`,
+        `end`,
+        ``,
+        `local function __vsrx_make_env(__vsrx_caller)`,
+        `    local __vsrx_scoped_require = function(__vsrx_target)`,
+        `        return __vsrx_require_from(__vsrx_caller, __vsrx_target)`,
+        `    end`,
+        `    local __vsrx_env = {}`,
+        `    setmetatable(__vsrx_env, {`,
+        `        __index = function(_, __vsrx_key)`,
+        `            if __vsrx_key == "require" then`,
+        `                return __vsrx_scoped_require`,
+        `            end`,
+        `            return __vsrx_base_env[__vsrx_key]`,
+        `        end,`,
+        `        __newindex = function(_, __vsrx_key, __vsrx_value)`,
+        `            __vsrx_base_env[__vsrx_key] = __vsrx_value`,
+        `        end`,
+        `    })`,
+        `    return __vsrx_env`,
+        `end`,
+        ``,
+        `local function __vsrx_run_source(__vsrx_caller, __vsrx_source)`,
+        `    local __vsrx_fn = __vsrx_load_source(__vsrx_source, __vsrx_caller)`,
+        `    local __vsrx_env = __vsrx_make_env(__vsrx_caller)`,
+        `    if setfenv then`,
+        `        setfenv(__vsrx_fn, __vsrx_env)`,
+        `        return __vsrx_fn()`,
+        `    end`,
+        ``,
+        `    local __vsrx_previous_require = __vsrx_base_env.require`,
+        `    __vsrx_base_env.require = __vsrx_env.require`,
+        `    local __vsrx_ok, __vsrx_value = pcall(__vsrx_fn)`,
+        `    __vsrx_base_env.require = __vsrx_previous_require`,
+        `    if not __vsrx_ok then`,
+        `        error("VSRX local require runtime error in " .. tostring(__vsrx_caller) .. ": " .. tostring(__vsrx_value), 2)`,
+        `    end`,
+        `    return __vsrx_value`,
+        `end`,
+        ``,
+        `function __vsrx_require_from(__vsrx_caller, __vsrx_target)`,
+        `    if type(__vsrx_target) ~= "string" then`,
+        `        return __vsrx_native_require(__vsrx_target)`,
+        `    end`,
+        ``,
+        `    local __vsrx_by_caller = __vsrx_resolve[__vsrx_caller]`,
+        `    local __vsrx_module_id = __vsrx_by_caller and __vsrx_by_caller[__vsrx_target] or nil`,
+        `    if not __vsrx_module_id then`,
+        `        return __vsrx_native_require(__vsrx_target)`,
+        `    end`,
+        ``,
+        `    local __vsrx_cached = __vsrx_cache[__vsrx_module_id]`,
+        `    if __vsrx_cached then`,
+        `        if __vsrx_cached.loading then`,
+        `            error("VSRX local require: circular require detected for " .. tostring(__vsrx_module_id), 2)`,
+        `        end`,
+        `        return __vsrx_cached.value`,
+        `    end`,
+        ``,
+        `    local __vsrx_source = __vsrx_module_sources[__vsrx_module_id]`,
+        `    if not __vsrx_source then`,
+        `        error("VSRX local require: module source was not linked: " .. tostring(__vsrx_module_id), 2)`,
+        `    end`,
+        ``,
+        `    local __vsrx_entry = { loading = true, value = nil }`,
+        `    __vsrx_cache[__vsrx_module_id] = __vsrx_entry`,
+        ``,
+        `    local __vsrx_ok, __vsrx_value = pcall(__vsrx_run_source, __vsrx_module_id, __vsrx_source)`,
+        `    if not __vsrx_ok then`,
+        `        __vsrx_cache[__vsrx_module_id] = nil`,
+        `        error(__vsrx_value, 2)`,
+        `    end`,
+        ``,
+        `    __vsrx_entry.loading = false`,
+        `    __vsrx_entry.value = __vsrx_value`,
+        `    return __vsrx_value`,
+        `end`,
+        ``,
+        `return __vsrx_run_source(${toLuaString(VSRX_ENTRY_MODULE_ID)}, __vsrx_entry_source)`,
+        `end)()`
+    ].join('\n');
+}
+
+function createResolutionTable(context: LocalRequireBundleContext): string {
+    const lines = [`local __vsrx_resolve = {`];
+
+    for (const [callerId, resolutions] of context.resolutions.entries()) {
+        if (resolutions.size === 0) {
+            continue;
+        }
+
+        lines.push(`    [${toLuaString(callerId)}] = {`);
+        for (const [request, moduleId] of resolutions.entries()) {
+            lines.push(`        [${toLuaString(request)}] = ${toLuaString(moduleId)},`);
+        }
+        lines.push(`    },`);
+    }
+
+    lines.push(`}`);
+    return lines.join('\n');
+}
+
+function getOrCreateResolutionMap(context: LocalRequireBundleContext, callerId: string): Map<string, string> {
+    let resolutions = context.resolutions.get(callerId);
+    if (!resolutions) {
+        resolutions = new Map<string, string>();
+        context.resolutions.set(callerId, resolutions);
+    }
+    return resolutions;
+}
+
+function getWorkspaceRootsForFile(filePath: string): string[] {
+    const roots: string[] = [];
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(filePath));
+
+    if (workspaceFolder) {
+        pushUniquePath(roots, workspaceFolder.uri.fsPath);
+    }
+
+    for (const folder of vscode.workspace.workspaceFolders ?? []) {
+        pushUniquePath(roots, folder.uri.fsPath);
+    }
+
+    if (roots.length === 0) {
+        pushUniquePath(roots, path.dirname(filePath));
+    }
+
+    return roots;
+}
+
+function isPathInsideAnyRoot(filePath: string, roots: string[]): boolean {
+    return roots.some(root => isPathInsideRoot(filePath, root));
+}
+
+function isPathInsideRoot(filePath: string, root: string): boolean {
+    const relative = path.relative(path.resolve(root), path.resolve(filePath));
+    return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function toModuleId(filePath: string, roots: string[]): string {
+    const root = roots.find(candidate => isPathInsideRoot(filePath, candidate));
+    const relativePath = root ? path.relative(root, filePath) : path.basename(filePath);
+    return relativePath.replace(/\\/g, '/');
+}
+
+function addBundleWarning(context: LocalRequireBundleContext, message: string) {
+    if (context.warningKeys.has(message)) {
+        return;
+    }
+
+    context.warningKeys.add(message);
+    context.warnings.push(message);
+}
+
+function uniquePaths(paths: string[]): string[] {
+    const seen = new Set<string>();
+    const unique: string[] = [];
+
+    for (const candidate of paths) {
+        const key = canonicalFileKey(candidate);
+        if (seen.has(key)) {
+            continue;
+        }
+
+        seen.add(key);
+        unique.push(candidate);
+    }
+
+    return unique;
+}
+
+function pushUniquePath(paths: string[], value: string) {
+    const key = canonicalFileKey(value);
+    if (!paths.some(existing => canonicalFileKey(existing) === key)) {
+        paths.push(path.resolve(value));
+    }
+}
+
+function canonicalFileKey(filePath: string): string {
+    return path.resolve(filePath).toLowerCase();
+}
+
+function toLuaString(value: string): string {
+    return `"${value
+        .replace(/\\/g, '\\\\')
+        .replace(/"/g, '\\"')
+        .replace(/\r/g, '\\r')
+        .replace(/\n/g, '\\n')
+        .replace(/\t/g, '\\t')
+        .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, character => {
+            return `\\${character.charCodeAt(0).toString().padStart(3, '0')}`;
+        })}"`;
 }
 
 async function saveScript() {
@@ -846,8 +1041,9 @@ async function showSavedScripts() {
             if (selected.isDir) {
                 vscode.env.openExternal(vscode.Uri.file((selected as any).fullPath));
             } else {
-                const scriptContent = fs.readFileSync((selected as any).fullPath, 'utf8');
-                void executeScript(scriptContent, (selected as any).fullPath);
+                const scriptPath = (selected as any).fullPath;
+                const scriptContent = fs.readFileSync(scriptPath, 'utf8');
+                executeRawScript(scriptContent, scriptPath);
             }
         }
     } catch (e: any) {
@@ -939,7 +1135,7 @@ async function showScriptHub(query: string = '', page: number = 1) {
                             showScriptHub(query, page - 1);
                         } else if (action === 'run') {
                             // @ts-ignore
-                            void executeScript(selected.scriptCode);
+                            executeRawScript(selected.scriptCode);
                         }
                     }
 

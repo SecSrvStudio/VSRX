@@ -6,32 +6,6 @@ end
 local HttpService = game:GetService("HttpService")
 local baseUrl = getgenv().VSRX_IP 
 local UserInputService = game:GetService("UserInputService")
-local nativeRequire = require
-
-local function runLoadedSource(source)
-    local wrappedSource = "local __VSRX_NATIVE_REQUIRE = require\nlocal function require(...)\n    return __VSRX_NATIVE_REQUIRE(...)\nend\n" .. source
-    local func, parseErr = loadstring(wrappedSource)
-    if not func then
-        warn("VSRX Parse Error: " .. tostring(parseErr))
-        return
-    end
-
-    if type(getfenv) == "function" and type(setfenv) == "function" then
-        local env = getgenv()
-        local ok, currentEnv = pcall(getfenv, func)
-        if ok and type(currentEnv) == "table" then
-            env = currentEnv
-        end
-
-        env.require = function(...)
-            return nativeRequire(...)
-        end
-
-        pcall(setfenv, func, env)
-    end
-
-    task.spawn(func)
-end
 
 if not getgenv().VSRX_States then
     getgenv().VSRX_States = {
@@ -108,7 +82,12 @@ Iris:Connect(function()
                     if runBtn.clicked then
                         local codeToRun = input.Instance.InputField.Text
                         if codeToRun and #codeToRun > 0 then
-                            runLoadedSource(codeToRun)
+                            local func, parseErr = loadstring(codeToRun)
+                            if func then
+                                task.spawn(func)
+                            else
+                                warn("VSRX Parse Error: " .. tostring(parseErr))
+                            end
                         end
                     end
                     
